@@ -76,10 +76,29 @@ SERVICES = {
 }
 
 
+# Cookie names that are unique per account/session.
+# When the same key name appears again, treat it as the start of a new set.
+KEY_COOKIE_NAMES = {
+    # Prime Video / Amazon
+    "at-main-av", "ubid-main-av", "session-id", "session-token",
+    "at-main", "ubid-main", "sess-at-main",
+    # Netflix
+    "NetflixId", "SecureNetflixId",
+    # Disney+
+    "bam.pa",
+    # common session identifiers
+    "SID",
+}
+
+
 def load_cookies(path):
     """Load cookies from a Netscape-format file.
-    Supports multiple independent cookie sets in one file
-    (separated by blank lines or comment blocks).
+
+    Supports multiple independent cookie sets in one file:
+    - Separated by blank lines or comment blocks
+    - Or continuously concatenated (detected by repeated key cookie names
+      such as at-main-av, NetflixId, etc.)
+
     Returns list of (jar, cookie_text) or empty list on error.
     """
     try:
@@ -90,37 +109,46 @@ def load_cookies(path):
     sets = []
     current_jar = []
     current_out = []
-    has_cookies = False
+    seen_keys = set()
 
     def flush():
-        nonlocal current_jar, current_out, has_cookies
+        nonlocal current_jar, current_out, seen_keys
         if current_jar:
             text = "\n".join(current_out) + ("\n" if current_out else "")
             sets.append((current_jar[:], text))
             current_jar = []
             current_out = []
-            has_cookies = False
+            seen_keys = set()
 
     for line in lines:
         s = line.strip()
         if not s:
-            if has_cookies:
+            if current_jar:
                 flush()
             continue
         if s.startswith("#"):
-            if has_cookies:
+            if current_jar:
                 flush()
             continue
         f = s.split("\t")
         if len(f) < 7:
             continue
+
+        name = f[5].strip()
+
+        # If this is a key cookie that we already saw in the current group,
+        # start a new independent cookie set.
+        if name in KEY_COOKIE_NAMES and name in seen_keys:
+            flush()
+
         try:
             exp = int(float(f[4])) if f[4] not in ("", "0") else 0
         except ValueError:
             exp = 0
+
         current_jar.append(
             {
-                "name": f[5].strip(),
+                "name": name,
                 "value": "".join(f[6:]).strip(),
                 "domain": f[0].strip(),
                 "path": f[2].strip(),
@@ -131,7 +159,8 @@ def load_cookies(path):
         current_out.append(
             "\t".join(x.strip() for x in f[:6]) + "\t" + "".join(f[6:]).strip()
         )
-        has_cookies = True
+        if name in KEY_COOKIE_NAMES:
+            seen_keys.add(name)
 
     flush()
     return sets, None
@@ -149,7 +178,11 @@ def expiry_label(jar):
 
 
 def fingerprint(jar):
-    keys = ("NetflixId", "SecureNetflixId", "SID", "at-main", "session-token", "bam.pa")
+    keys = (
+        "NetflixId", "SecureNetflixId", "SID",
+        "at-main", "at-main-av", "ubid-main", "ubid-main-av",
+        "session-token", "session-id", "bam.pa",
+    )
     parts = sorted(f"{c['name']}={c['value']}" for c in jar if c["name"] in keys)
     if not parts:
         parts = sorted(f"{c['name']}={c['value'][:16]}" for c in jar[:6])
