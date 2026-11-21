@@ -10,8 +10,12 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 REQ = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9", "Accept": "text/html"}
 STATUS_MAP = {"a": "alive", "d": "dead", "b": "blocked", "e": "error"}
 SVC_LABEL = {
-    "netflix": "Netflix", "disney": "Disney", "prime": "Prime",
-    "dazn": "DAZN", "hulu": "Hulu", "paramount": "Paramount",
+    "netflix": "Netflix",
+    "disney": "Disney",
+    "prime": "Prime",
+    "dazn": "DAZN",
+    "hulu": "Hulu",
+    "paramount": "Paramount",
 }
 
 SERVICES = {
@@ -73,14 +77,39 @@ SERVICES = {
 
 
 def load_cookies(path):
+    """Load cookies from a Netscape-format file.
+    Supports multiple independent cookie sets in one file
+    (separated by blank lines or comment blocks).
+    Returns list of (jar, cookie_text) or empty list on error.
+    """
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as e:
-        return None, str(e), ""
-    jar, out = [], []
+        return [], str(e)
+
+    sets = []
+    current_jar = []
+    current_out = []
+    has_cookies = False
+
+    def flush():
+        nonlocal current_jar, current_out, has_cookies
+        if current_jar:
+            text = "\n".join(current_out) + ("\n" if current_out else "")
+            sets.append((current_jar[:], text))
+            current_jar = []
+            current_out = []
+            has_cookies = False
+
     for line in lines:
         s = line.strip()
-        if not s or s.startswith("#"):
+        if not s:
+            if has_cookies:
+                flush()
+            continue
+        if s.startswith("#"):
+            if has_cookies:
+                flush()
             continue
         f = s.split("\t")
         if len(f) < 7:
@@ -89,13 +118,23 @@ def load_cookies(path):
             exp = int(float(f[4])) if f[4] not in ("", "0") else 0
         except ValueError:
             exp = 0
-        jar.append({
-            "name": f[5].strip(), "value": "".join(f[6:]).strip(),
-            "domain": f[0].strip(), "path": f[2].strip(),
-            "secure": f[3].strip().upper() == "TRUE", "expires": exp,
-        })
-        out.append("\t".join(x.strip() for x in f[:6]) + "\t" + "".join(f[6:]).strip())
-    return jar, None, "\n".join(out) + ("\n" if out else "")
+        current_jar.append(
+            {
+                "name": f[5].strip(),
+                "value": "".join(f[6:]).strip(),
+                "domain": f[0].strip(),
+                "path": f[2].strip(),
+                "secure": f[3].strip().upper() == "TRUE",
+                "expires": exp,
+            }
+        )
+        current_out.append(
+            "\t".join(x.strip() for x in f[:6]) + "\t" + "".join(f[6:]).strip()
+        )
+        has_cookies = True
+
+    flush()
+    return sets, None
 
 
 def expiry_label(jar):
@@ -123,7 +162,13 @@ def session(jar, proxy=None):
     if proxy:
         s.proxies = {"http": proxy, "https": proxy}
     for c in jar:
-        s.cookies.set(c["name"], c["value"], domain=c["domain"], path=c["path"], secure=c["secure"])
+        s.cookies.set(
+            c["name"],
+            c["value"],
+            domain=c["domain"],
+            path=c["path"],
+            secure=c["secure"],
+        )
     return s
 
 
@@ -140,17 +185,24 @@ def detect(jar):
     return "netflix"
 
 
-def check_one(path, service, retries=2, timeout=25, proxy=None, delay=0.0):
+def check_one(item, service, retries=2, timeout=25, proxy=None, delay=0.0):
+    """item is dict with path, source, jar, cookie_text, idx"""
     if delay:
         time.sleep(delay)
-    jar, err, cookie_text = load_cookies(path)
+    path = item["path"]
+    jar = item["jar"]
+    cookie_text = item["cookie_text"]
     rec = {
-        "source": path.name, "path": str(path), "service": service,
-        "verdict": "", "detail": "", "country": "", "plan": "",
-        "expiry": "", "cookie_text": cookie_text or "",
+        "source": item["source"],
+        "path": str(path),
+        "service": service,
+        "verdict": "",
+        "detail": "",
+        "country": "",
+        "plan": "",
+        "expiry": "",
+        "cookie_text": cookie_text or "",
     }
-    if err:
-        return {**rec, "verdict": "error", "detail": "read fail"}
     if not jar:
         return {**rec, "verdict": "dead", "detail": "no cookie"}
 
@@ -168,7 +220,9 @@ def check_one(path, service, retries=2, timeout=25, proxy=None, delay=0.0):
 
     for attempt in range(retries + 1):
         try:
-            r = session(jar, proxy).get(cfg["url"], timeout=timeout, allow_redirects=False)
+            r = session(jar, proxy).get(
+                cfg["url"], timeout=timeout, allow_redirects=False
+            )
         except requests.RequestException as e:
             rec.update(verdict="error", detail=type(e).__name__)
             time.sleep(1.5 * (attempt + 1))
@@ -182,7 +236,11 @@ def check_one(path, service, retries=2, timeout=25, proxy=None, delay=0.0):
         if code in (301, 302, 303, 307, 308):
             loc = (r.headers.get("Location") or "").lower()
             dead = any(x in loc for x in cfg["login"])
-            return {**rec, "verdict": "dead", "detail": "login redirect" if dead else "redirect"}
+            return {
+                **rec,
+                "verdict": "dead",
+                "detail": "login redirect" if dead else "redirect",
+            }
         if code >= 500:
             rec.update(verdict="error", detail=f"HTTP {code}")
             time.sleep(1.5 * (attempt + 1))
@@ -203,7 +261,8 @@ def check_one(path, service, retries=2, timeout=25, proxy=None, delay=0.0):
             plan = "Prime"
 
         rec.update(
-            verdict="alive", detail="ok",
+            verdict="alive",
+            detail="ok",
             country=grab(cfg["country"], body) if cfg.get("country") else "",
             plan=plan,
         )
@@ -213,7 +272,11 @@ def check_one(path, service, retries=2, timeout=25, proxy=None, delay=0.0):
 
 
 def collect(targets):
-    files, seen = [], set()
+    """Collect cookie items. Each item is one independent cookie set.
+    Files containing multiple sets (separated by blank lines / comments)
+    are automatically split into one item per set.
+    """
+    items, seen_files = [], set()
     for raw in targets:
         p = Path(raw)
         if not p.exists():
@@ -221,31 +284,67 @@ def collect(targets):
             continue
         found = [p.resolve()] if p.is_file() else sorted(p.rglob("*.txt"))
         for f in found:
-            if f.suffix.lower() == ".txt" and f not in seen:
-                seen.add(f)
-                files.append(f)
-    return files
+            if f.suffix.lower() != ".txt" or f in seen_files:
+                continue
+            seen_files.add(f)
+            sets, err = load_cookies(f)
+            if err:
+                # keep a placeholder so error is reported
+                items.append(
+                    {
+                        "path": f,
+                        "source": f.name,
+                        "jar": [],
+                        "cookie_text": "",
+                        "idx": 0,
+                    }
+                )
+                continue
+            if not sets:
+                items.append(
+                    {
+                        "path": f,
+                        "source": f.name,
+                        "jar": [],
+                        "cookie_text": "",
+                        "idx": 0,
+                    }
+                )
+                continue
+            multi = len(sets) > 1
+            for i, (jar, text) in enumerate(sets):
+                src = f.name if not multi else f"{f.stem}_{i+1}{f.suffix}"
+                items.append(
+                    {
+                        "path": f,
+                        "source": src,
+                        "jar": jar,
+                        "cookie_text": text,
+                        "idx": i,
+                    }
+                )
+    return items
 
 
-def dedupe(files):
+def dedupe(items):
     kept, seen, skipped = [], set(), 0
-    for f in files:
-        jar, err, _ = load_cookies(f)
-        if err or not jar:
-            kept.append(f)
+    for item in items:
+        jar = item.get("jar") or []
+        if not jar:
+            kept.append(item)
             continue
         fp = fingerprint(jar)
         if fp in seen:
             skipped += 1
             continue
         seen.add(fp)
-        kept.append(f)
+        kept.append(item)
     return kept, skipped
 
 
 def safe(s, fb="XX"):
     s = re.sub(r'[\\/:*?"<>|\s]+', "_", (s or "").strip())
-    return (s[:32] if s else fb)
+    return s[:32] if s else fb
 
 
 def make_name(rec):
@@ -259,25 +358,30 @@ def make_name(rec):
 def main():
     ap = argparse.ArgumentParser(description="Streaming Cookie Checker")
     ap.add_argument("targets", nargs="+")
-    ap.add_argument("-s", default="auto",
-                    choices=["auto", "netflix", "disney", "prime", "dazn", "hulu", "paramount"])
+    ap.add_argument(
+        "-s",
+        default="auto",
+        choices=["auto", "netflix", "disney", "prime", "dazn", "hulu", "paramount"],
+    )
     ap.add_argument("-w", type=int, default=6)
     ap.add_argument("-t", type=int, default=25)
     ap.add_argument("-p", default=None)
-    ap.add_argument("-r", default="a", help="status to save: a/d/b/e (default: a = alive only)")
+    ap.add_argument(
+        "-r", default="a", help="status to save: a/d/b/e (default: a = alive only)"
+    )
     ap.add_argument("--delay", type=float, default=0.0)
     ap.add_argument("--no-dedupe", action="store_true")
     ap.add_argument("--retries", type=int, default=2, help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     want = {STATUS_MAP[c] for c in re.findall(r"[adbe]", args.r.lower())} or {"alive"}
-    files = collect(args.targets)
-    if not files:
+    items = collect(args.targets)
+    if not items:
         sys.exit("no .txt files")
 
     skipped = 0
     if not args.no_dedupe:
-        files, skipped = dedupe(files)
+        items, skipped = dedupe(items)
 
     out = SCRIPT_DIR / "result"
     out.mkdir(parents=True, exist_ok=True)
@@ -286,28 +390,38 @@ def main():
     print("  Streaming Cookie Checker")
     print("=" * 52)
     print(f"  service : {args.s}")
-    print(f"  files   : {len(files)}" + (f"  (dup skipped: {skipped})" if skipped else ""))
+    print(
+        f"  cookies : {len(items)}"
+        + (f"  (dup skipped: {skipped})" if skipped else "")
+    )
     print(f"  workers : {args.w}   delay: {args.delay}s")
     print(f"  export  : {', '.join(sorted(want))}")
     print("=" * 52)
 
     results, done = [], 0
 
-    def job(p):
-        return check_one(p, args.s, args.retries, args.t, args.p, args.delay)
+    def job(item):
+        return check_one(item, args.s, args.retries, args.t, args.p, args.delay)
 
     with ThreadPoolExecutor(max_workers=args.w) as ex:
-        futs = {ex.submit(job, p): p for p in files}
+        futs = {ex.submit(job, item): item for item in items}
         for fut in as_completed(futs):
             rec = fut.result()
             results.append(rec)
             done += 1
-            mark = {"alive": "OK ", "dead": "-- ", "blocked": "BLK", "error": "ERR"}.get(rec["verdict"], "??")
+            mark = {
+                "alive": "OK ",
+                "dead": "-- ",
+                "blocked": "BLK",
+                "error": "ERR",
+            }.get(rec["verdict"], "??")
             extra = ""
             if rec["verdict"] == "alive":
                 extra = f"  {rec['country']} {rec['plan']} exp:{rec['expiry']}"
-            print(f"  {done:>3}/{len(files)}  [{mark}] {(rec.get('service') or args.s):<8}  "
-                  f"{rec['source'][:28]:<28}  {rec['detail']}{extra}")
+            print(
+                f"  {done:>3}/{len(items)}  [{mark}] {(rec.get('service') or args.s):<8}  "
+                f"{rec['source'][:28]:<28}  {rec['detail']}{extra}"
+            )
 
     # result / Netflix / JP_Netflix_uuid.txt
     moved = {}
